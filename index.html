@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <title>Pinball (Mobile)</title>
+    <style>
+        html,
+        body {
+            height: 100%;
+            margin: 0;
+        }
+
+        body {
+            background: #0b0f14;
+            color: #e6f1ff;
+            font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial, "Apple Color Emoji", "Segoe UI Emoji";
+            overflow: hidden;
+        }
+
+        #wrap {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        canvas {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            display: block;
+            touch-action: none;
+        }
+
+        .hud {
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: 0;
+            display: flex;
+            justify-content: space-between;
+            padding: 10px 14px;
+            pointer-events: none;
+            font-weight: 700;
+            text-shadow: 0 1px 0 #0008;
+        }
+
+        .hud .pill {
+            background: #112031cc;
+            border: 1px solid #2b3a4acc;
+            padding: 6px 10px;
+            border-radius: 999px;
+        }
+
+        .btnbar {
+            position: absolute;
+            bottom: 10px;
+            left: 0;
+            right: 0;
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        button {
+            background: #16324a;
+            border: 1px solid #355a7a;
+            color: #e6f1ff;
+            padding: 10px 14px;
+            border-radius: 10px;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        button:active {
+            transform: translateY(1px);
+        }
+
+        .touch-hints {
+            position: absolute;
+            inset: 0;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            pointer-events: none;
+        }
+
+        .touch-hints div {
+            border: 0px dashed #5aa9ff22;
+        }
+
+        .toast {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            background: #0b1624cc;
+            border: 1px solid #224;
+            padding: 10px 14px;
+            border-radius: 8px;
+            opacity: 0;
+            transition: opacity .25s ease;
+            pointer-events: none;
+        }
+
+        .toast.show {
+            opacity: 1;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="wrap">
+        <canvas id="game" aria-label="Pinball playfield"></canvas>
+        <div class="hud">
+            <div class="pill" id="score">Score: 0</div>
+            <div class="pill" id="balls">Balls: 3</div>
+            <div class="pill" id="hi">Best: 0</div>
+        </div>
+        <div class="btnbar">
+            <button id="restart">Restart</button>
+            <button id="pause">Pause</button>
+        </div>
+        <div id="toast" class="toast">Tap left/right side to flip</div>
+        <div class="touch-hints">
+            <div></div>
+            <div></div>
+        </div>
+    </div>
+
+    <script>
+        (() => {
+            // ----- Utility -----------------------------------------------------------
+            const TAU = Math.PI * 2;
+            const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+            const lerp = (a, b, t) => a + (b - a) * t;
+            const now = () => performance.now() / 1000;
+
+            function vec(x = 0, y = 0) { return { x, y } }
+            const add = (a, b) => vec(a.x + b.x, a.y + b.y);
+            const sub = (a, b) => vec(a.x - b.x, a.y - b.y);
+            const mul = (a, s) => vec(a.x * s, a.y * s);
+            const dot = (a, b) => a.x * b.x + a.y * b.y;
+            const len = (a) => Math.hypot(a.x, a.y);
+            const norm = (a) => { const l = len(a) || 1; return vec(a.x / l, a.y / l) };
+            const perp = (a) => vec(-a.y, a.x);
+
+            function closestPointOnSegment(p, a, b) {
+                const ab = sub(b, a);
+                const t = clamp(dot(sub(p, a), ab) / (dot(ab, ab) || 1), 0, 1);
+                return add(a, mul(ab, t));
+            }
+
+            // ----- Canvas / Resize ---------------------------------------------------
+            const DPR = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+            const canvas = document.getElementById('game');
+            const ctx = canvas.getContext('2d');
+            const scoreEl = document.getElementById('score');
+            const ballsEl = document.getElementById('balls');
+            const hiEl = document.getElementById('hi');
+            const toastEl = document.getElementById('toast');
+
+            // World size in logical units; we scale to fit keeping aspect.
+            const W = 420; const H = 740;
+            let viewScale = 1; // px per world unit
+            let viewOffset = vec(0, 0);
+            function resize() {
+                const bw = window.innerWidth, bh = window.innerHeight;
+                // Leave space for HUD/Button bar (~68px), but canvas fills; we just scale to fit fully.
+                canvas.width = Math.floor(bw * DPR);
+                canvas.height = Math.floor(bh * DPR);
+                canvas.style.width = bw + 'px';
+                canvas.style.height = bh + 'px';
+                const sx = (canvas.width) / W;
+                const sy = (canvas.height) / H;
+                viewScale = Math.min(sx, sy);
+                // center
+                const vw = W * viewScale;
+                const vh = H * viewScale;
+                viewOffset = vec((canvas.width - vw) / 2, (canvas.height - vh) / 2);
+            }
+            window.addEventListener('resize', resize, { passive: true });
+
+            function toScreen(p) { return add(mul(p, viewScale), viewOffset); }
+            function fromScreen(p) { return vec((p.x - viewOffset.x) / viewScale, (p.y - viewOffset.y) / viewScale); }
+
+            // ----- Input -------------------------------------------------------------
+            let leftHeld = false, rightHeld = false;
+            let paused = false;
+
+            function setToast(show) { toastEl.classList.toggle('show', !!show); }
+
+            // Touch: left half/right half = flippers
+            function handleTouches(touches) {
+                leftHeld = rightHeld = false;
+                const half = canvas.width / 2;
+                for (const t of touches) {
+                    const x = t.clientX * DPR, y = t.clientY * DPR;
+                    if (x < half) leftHeld = true; else rightHeld = true;
+                }
+            }
+            window.addEventListener('touchstart', e => { handleTouches(e.touches); e.preventDefault(); }, { passive: false });
+            window.addEventListener('touchmove', e => { handleTouches(e.touches); e.preventDefault(); }, { passive: false });
+            window.addEventListener('touchend', e => { handleTouches(e.touches); e.preventDefault(); }, { passive: false });
+            window.addEventListener('touchcancel', e => { handleTouches(e.touches); e.preventDefault(); }, { passive: false });
+
+            // Keyboard fallback
+            window.addEventListener('keydown', e => {
+                if (e.code === 'ArrowLeft' || e.code === 'KeyA') leftHeld = true;
+                if (e.code === 'ArrowRight' || e.code === 'KeyD') rightHeld = true;
+                if (e.code === 'Space') paused = !paused;
+            });
+            window.addEventListener('keyup', e => {
+                if (e.code === 'ArrowLeft' || e.code === 'KeyA') leftHeld = false;
+                if (e.code === 'ArrowRight' || e.code === 'KeyD') rightHeld = false;
+            });
+
+            document.getElementById('restart').addEventListener('click', () => resetGame());
+            document.getElementById('pause').addEventListener('click', () => { paused = !paused; });
+
+            // ----- Physics World -----------------------------------------------------
+            const GRAVITY = vec(0, 1200);
+            const RESTITUTION = 0.8; // bounciness on rails
+            const RAIL_R = 6; // rail thickness for capsule collisions
+
+            const state = {
+                score: 0,
+                balls: 3,
+                best: Number(localStorage.getItem('pinball_best') || 0),
+                started: false,
+            };
+
+            // Ball
+            const ball = {
+                p: vec(W * 0.25, 80),
+                v: vec(0, 0),
+                r: 10,
+                mass: 1,
+            };
+
+            function spawnBall() {
+                ball.p = vec(W * 0.80, 80);
+                ball.v = vec(0, 20);
+            }
+
+            // Rails are capsules: segment [a,b] with radius RAIL_R
+            /** @type {{a:{x:number,y:number}, b:{x:number,y:number}}[]} */
+            const rails = [];
+            // Bumpers are circles
+            /** @type {{c:{x:number,y:number}, r:number, boost:number, score:number}[]} */
+            const bumpers = [];
+
+            function buildBoard() {
+                rails.length = 0; bumpers.length = 0;
+                const m = 12; // margin
+                // Outer frame
+                rails.push({ a: vec(m, m), b: vec(W - m, m) });
+                rails.push({ a: vec(m, m), b: vec(m, H - m) });
+                rails.push({ a: vec(W - m, m), b: vec(W - m, H - m) });
+
+                // Bottom left/right funnel to flippers
+                rails.push({ a: vec(m, H - 180), b: vec(W * 0.38, H - 56) });
+                rails.push({ a: vec(W - m, H - 180), b: vec(W * 0.62, H - 56) });
+
+                // Short posts at the drain edges (to make a center gap)
+                // rails.push({ a: vec(W * 0.38, H - 56), b: vec(W * 0.38, H - m) });
+                // rails.push({ a: vec(W * 0.62, H - 56), b: vec(W * 0.62, H - m) });
+                // (arch removed to prevent the ball from resting on it)
+
+                // Inlanes (decorative small guides)
+                // rails.push({ a: vec(W * 0.30, H - 120), b: vec(W * 0.38, H - 56) });
+                // rails.push({ a: vec(W * 0.70, H - 120), b: vec(W * 0.62, H - 56) });
+
+                // Bumpers cluster
+                bumpers.push({ c: vec(W * 0.30, 220), r: 18, boost: 380, score: 150 });
+                bumpers.push({ c: vec(W * 0.50, 200), r: 20, boost: 420, score: 200 });
+                bumpers.push({ c: vec(W * 0.70, 220), r: 18, boost: 380, score: 150 });
+                bumpers.push({ c: vec(W * 0.40, 320), r: 16, boost: 350, score: 120 });
+                bumpers.push({ c: vec(W * 0.60, 320), r: 16, boost: 350, score: 120 });
+            }
+
+            // Flippers (capsules with rotation around a pivot)
+            class Flipper {
+                constructor(pivotX, pivotY, length, radius, angleRest, angleUp) {
+                    this.pivot = vec(pivotX, pivotY);
+                    this.length = length;
+                    this.radius = radius;
+                    this.angle = angleRest;
+                    this.target = angleRest;
+                    this.angleRest = angleRest;
+                    this.angleUp = angleUp;
+                    this.angVel = 0;
+                    this.speed = 18; // rad/s target clamp
+                    this.k = 22; // proportional gain
+                }
+                hold(up) { this.target = up ? this.angleUp : this.angleRest; }
+                update(dt) {
+                    // critically damped-ish PD controller
+                    const err = this.target - this.angle;
+                    const desired = clamp(err * this.k, -this.speed, this.speed);
+                    // smooth reach to desired angular velocity
+                    this.angVel = lerp(this.angVel, desired, clamp(dt * 10, 0, 1));
+                    this.angle += this.angVel * dt;
+                }
+                end() { // endpoint of the center line
+                    const dir = vec(Math.cos(this.angle), Math.sin(this.angle));
+                    return add(this.pivot, mul(dir, this.length));
+                }
+                // velocity of a point due to rotation around pivot
+                velocityAt(point) {
+                    const r = sub(point, this.pivot);
+                    // omega x r (2D) => (-w*r.y, w*r.x)
+                    return vec(-this.angVel * r.y, this.angVel * r.x);
+                }
+            }
+
+            const leftFlip = new Flipper(W * 0.30, H - 42, 95, 10, 0.45, -0.95);
+            const rightFlip = new Flipper(W * 0.70, H - 42, 95, 10, Math.PI - 0.45, Math.PI + 0.95);
+
+            function ballVsCapsule(p, v, r, a, b, R, surfaceVel) {
+                // Find closest point on segment AB to ball center P
+                const cp = closestPointOnSegment(p, a, b);
+                const nVec = sub(p, cp);
+                let dist = len(nVec);
+                const rad = r + R;
+                if (dist === 0) { // avoid NaN
+                    dist = 0.0001;
+                }
+                if (dist < rad) {
+                    const n = vec(nVec.x / dist, nVec.y / dist); // collision normal from rail to ball
+                    const penetration = rad - dist;
+                    // Project ball out of rail
+                    p.x += n.x * penetration; p.y += n.y * penetration;
+
+                    // Resolve velocity using relative motion (ball vs surface)
+                    const rel = sub(v, surfaceVel || vec(0, 0));
+                    const vn = dot(rel, n);
+                    if (vn < 0) {
+                        const vt = sub(rel, mul(n, vn));
+                        const relAfter = add(mul(n, -vn * RESTITUTION), mul(vt, 0.88)); // tangential friction
+                        const vNew = add(surfaceVel || vec(0, 0), relAfter);
+                        v.x = vNew.x; v.y = vNew.y;
+                    }
+                    return true;
+                }
+                return false;
+            }
+
+            function ballVsCircle(b, c, r, restitution = 1.0) {
+                const d = sub(b.p, c);
+                let L = len(d);
+                const rad = b.r + r;
+                if (L === 0) L = 0.0001;
+                if (L < rad) {
+                    const n = vec(d.x / L, d.y / L);
+                    const pen = rad - L;
+                    b.p.x += n.x * pen; b.p.y += n.y * pen;
+                    const vn = dot(b.v, n);
+                    if (vn < 0) {
+                        const vt = sub(b.v, mul(n, vn));
+                        const after = add(mul(n, -vn * restitution), mul(vt, 0.9));
+                        b.v = after;
+                    }
+                    return true;
+                }
+                return false;
+            }
+
+            // ----- Game Loop ---------------------------------------------------------
+            let last = 0; let acc = 0; const FIXED = 1 / 240; const MAX_STEPS = 5;
+
+            function step(dt) {
+                // Input -> flippers desired
+                leftFlip.hold(leftHeld);
+                rightFlip.hold(rightHeld);
+
+                // Update flippers
+                leftFlip.update(dt);
+                rightFlip.update(dt);
+
+                // Integrate ball
+                ball.v = add(ball.v, mul(GRAVITY, dt));
+                ball.p = add(ball.p, mul(ball.v, dt));
+
+                // Collisions: rails
+                for (let i = 0; i < rails.length; i++) {
+                    const seg = rails[i];
+                    if (ballVsCapsule(ball.p, ball.v, ball.r, seg.a, seg.b, RAIL_R)) { }
+                }
+
+                // Collisions: flippers (moving capsules)
+                // Left
+                {
+                    const a = leftFlip.pivot, b = leftFlip.end();
+                    const cp = closestPointOnSegment(ball.p, a, b);
+                    const vSurf = leftFlip.velocityAt(cp);
+                    ballVsCapsule(ball.p, ball.v, ball.r, a, b, leftFlip.radius, vSurf);
+                }
+                // Right
+                {
+                    const a = rightFlip.pivot, b = rightFlip.end();
+                    const cp = closestPointOnSegment(ball.p, a, b);
+                    const vSurf = rightFlip.velocityAt(cp);
+                    ballVsCapsule(ball.p, ball.v, ball.r, a, b, rightFlip.radius, vSurf);
+                }
+
+                // Collisions: bumpers
+                for (const bu of bumpers) {
+                    if (ballVsCircle(ball, bu.c, bu.r, 1.15)) {
+                        // Apply an outward boost
+                        const n = norm(sub(ball.p, bu.c));
+                        ball.v = add(ball.v, mul(n, bu.boost));
+                        addScore(bu.score);
+                        flashAt(bu.c);
+                    }
+                }
+
+                // Drain check
+                if (ball.p.y - ball.r > H + 40) {
+                    loseBall();
+                }
+
+                // Keep ball within a safe horizontal bound (just in case)
+                if (ball.p.x < ball.r + 2) { ball.p.x = ball.r + 2; ball.v.x = Math.abs(ball.v.x) * 0.7; }
+                if (ball.p.x > W - ball.r - 2) { ball.p.x = W - ball.r - 2; ball.v.x = -Math.abs(ball.v.x) * 0.7; }
+            }
+
+            // ----- Scoring / Lives ---------------------------------------------------
+            function addScore(s) { state.score += s; scoreEl.textContent = `Score: ${state.score}`; }
+            function loseBall() {
+                state.balls -= 1; ballsEl.textContent = `Balls: ${state.balls}`;
+                if (state.balls <= 0) {
+                    // Game over -> reset after short pause
+                    state.best = Math.max(state.best, state.score);
+                    localStorage.setItem('pinball_best', String(state.best));
+                    hiEl.textContent = `Best: ${state.best}`;
+                    // Soft reset
+                    state.score = 0; scoreEl.textContent = `Score: ${state.score}`;
+                    state.balls = 3; ballsEl.textContent = `Balls: ${state.balls}`;
+                }
+                spawnBall();
+            }
+
+            function resetGame() {
+                state.score = 0; scoreEl.textContent = `Score: ${state.score}`;
+                state.balls = 3; ballsEl.textContent = `Balls: ${state.balls}`;
+                spawnBall();
+            }
+
+            // ----- FX ---------------------------------------------------------------
+            const sparks = [];
+            function flashAt(p) {
+                // create tiny spark burst
+                for (let i = 0; i < 6; i++) {
+                    const a = Math.random() * TAU; const s = 40 + Math.random() * 140;
+                    sparks.push({ p: vec(p.x, p.y), v: vec(Math.cos(a) * s, Math.sin(a) * s), life: 0.25 });
+                }
+            }
+            function updateFX(dt) {
+                for (let i = sparks.length - 1; i >= 0; i--) {
+                    const sp = sparks[i];
+                    sp.life -= dt; if (sp.life <= 0) { sparks.splice(i, 1); continue; }
+                    sp.v = add(sp.v, mul(GRAVITY, dt * 0.15));
+                    sp.p = add(sp.p, mul(sp.v, dt));
+                }
+            }
+
+            // ----- Render ------------------------------------------------------------
+            function draw() {
+                // Clear
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                // Board background
+                const p0 = toScreen(vec(0, 0));
+                const p1 = toScreen(vec(W, H));
+                ctx.fillStyle = '#081018';
+                ctx.fillRect(p0.x, p0.y, p1.x - p0.x, p1.y - p0.y);
+
+                // Decorative gradient
+                const g = ctx.createLinearGradient(p0.x, p0.y, p1.x, p1.y);
+                g.addColorStop(0, '#0c1f33');
+                g.addColorStop(1, '#0b0f15');
+                ctx.fillStyle = g;
+                ctx.fillRect(p0.x + 6, p0.y + 6, p1.x - p0.x - 12, p1.y - p0.y - 12);
+
+                // Rails
+                ctx.strokeStyle = '#9fd1ff';
+                ctx.lineWidth = Math.max(1, RAIL_R * 2 * viewScale);
+                ctx.lineCap = 'round';
+                ctx.beginPath();
+                for (const s of rails) {
+                    const A = toScreen(s.a), B = toScreen(s.b);
+                    ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y);
+                }
+                ctx.stroke();
+
+                // Bumpers
+                for (const b of bumpers) {
+                    const C = toScreen(b.c);
+                    ctx.beginPath();
+                    ctx.fillStyle = '#52e5ff';
+                    ctx.arc(C.x, C.y, (b.r + 2) * viewScale, 0, TAU);
+                    ctx.fill();
+                    ctx.beginPath();
+                    ctx.fillStyle = '#0b1f33';
+                    ctx.arc(C.x, C.y, (b.r - 2) * viewScale, 0, TAU);
+                    ctx.fill();
+                }
+
+                // Flippers
+                function drawFlipper(fl) {
+                    const A = toScreen(fl.pivot), B = toScreen(fl.end());
+                    ctx.strokeStyle = '#ffd36b';
+                    ctx.lineWidth = Math.max(1, fl.radius * 2 * viewScale);
+                    ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke();
+                    // pivot
+                    ctx.beginPath(); ctx.fillStyle = '#ffe08a';
+                    ctx.arc(A.x, A.y, Math.max(2, fl.radius * viewScale * 0.8), 0, TAU); ctx.fill();
+                }
+                drawFlipper(leftFlip); drawFlipper(rightFlip);
+
+                // Ball
+                const PB = toScreen(ball.p);
+                const rpx = Math.max(1, ball.r * viewScale);
+                ctx.beginPath();
+                ctx.fillStyle = '#ffffff';
+                ctx.arc(PB.x, PB.y, rpx, 0, TAU);
+                ctx.fill();
+                // small highlight
+                ctx.beginPath();
+                ctx.fillStyle = '#d0f0ff';
+                ctx.arc(PB.x - rpx * 0.35, PB.y - rpx * 0.35, rpx * 0.35, 0, TAU);
+                ctx.fill();
+
+                // Sparks
+                for (const sp of sparks) {
+                    const ps = toScreen(sp.p);
+                    ctx.globalAlpha = clamp(sp.life / 0.25, 0, 1);
+                    ctx.fillStyle = '#93f0ff';
+                    ctx.fillRect(ps.x - 2, ps.y - 2, 4, 4);
+                    ctx.globalAlpha = 1;
+                }
+
+                // Help text
+                if (!state.started) {
+                    ctx.fillStyle = '#c6e2ffcc';
+                    ctx.font = `${Math.round(18 * DPR)}px system-ui, -apple-system, Segoe UI, Roboto`;
+                    ctx.textAlign = 'center';
+                    ctx.fillText('Tap left/right to flip • Press Restart to respawn ball', canvas.width / 2, viewOffset.y + 28 * DPR);
+                }
+            }
+
+            // ----- Main --------------------------------------------------------------
+            function init() {
+                resize();
+                buildBoard();
+                leftHeld = rightHeld = false;
+                resetGame();
+                setToast(true);
+                setTimeout(() => setToast(false), 2000);
+                last = now(); acc = 0;
+                requestAnimationFrame(loop);
+            }
+
+            function loop() {
+                const t = now();
+                let dt = Math.min(0.033, t - last); // clamp big pauses
+                last = t;
+                if (!paused) {
+                    acc += dt;
+                    let steps = 0;
+                    while (acc >= FIXED && steps < 12) {
+                        step(FIXED);
+                        updateFX(FIXED);
+                        acc -= FIXED; steps++;
+                    }
+                }
+                draw();
+                requestAnimationFrame(loop);
+            }
+
+            // Start when user interacts first time to avoid mobile throttling
+            window.addEventListener('pointerdown', () => { state.started = true; }, { once: false });
+
+            // Kick it off
+            init();
+        })();
+    </script>
+</body>
+
+</html>
